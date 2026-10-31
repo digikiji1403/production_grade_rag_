@@ -1,0 +1,30 @@
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+
+# Environment secrets
+.env
+.env.*
+
+# Keep the example configuration
+!.env.example
+
+# Editors and operating systems
+.vscode/
+.idea/
+.DS_Store
+
+# Logs
+*.log
+
+# Uploaded document files
+backend/storage/documents/*
+!backend/storage/documents/.gitkeep
+# Local vector database and runtime storage
+backend/storage/qdrant/
+*.db
+*.sqlite
+*.sqlite3
