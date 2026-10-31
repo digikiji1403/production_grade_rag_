@@ -42,6 +42,11 @@ class Settings(BaseSettings):
     embedding_batch_size: int = 32
     embedding_timeout_seconds: int = 120
 
+    # Local Ollama generation
+    generation_model: str = "qwen3:4b"
+    generation_timeout_seconds: int = 180
+    generation_temperature: float = 0.0
+
     # Local Qdrant vector storage
     qdrant_storage_path: str = "backend/storage/qdrant"
     qdrant_collection_name: str = "ragforge_chunks"

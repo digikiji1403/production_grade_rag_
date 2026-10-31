@@ -111,6 +111,23 @@ def test_query_returns_ranked_results(client, monkeypatch):
         fake_retrieve_chunks,
     )
 
+    class FakeGenerationService:
+        def __init__(self, **kwargs):
+            pass
+
+        def generate(self, system_prompt, user_prompt):
+            assert "Explain RAG" in user_prompt
+            return "RAG combines retrieval and generation [S1]."
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(
+        query_route,
+        "OllamaGenerationService",
+        FakeGenerationService,
+    )
+
     response = client.post(
         f"/api/v1/knowledge-bases/{knowledge_base_id}/query",
         headers=headers,
@@ -122,6 +139,11 @@ def test_query_returns_ranked_results(client, monkeypatch):
     data = response.json()
     assert data["query"] == "Explain RAG"
     assert data["knowledge_base_id"] == knowledge_base_id
+    assert data["answer"] == "RAG combines retrieval and generation [S1]."
+    assert len(data["sources"]) == 1
+    assert data["sources"][0]["source_id"] == "S1"
+    assert data["sources"][0]["filename"] == "rag-notes.pdf"
+    assert data["sources"][0]["page_numbers"] == [2, 3]
     assert len(data["results"]) == 1
     assert data["results"][0]["filename"] == "rag-notes.pdf"
     assert data["results"][0]["score"] == pytest.approx(0.91)
@@ -172,3 +194,150 @@ def test_query_returns_503_when_retrieval_is_unavailable(
     assert response.json()["detail"] == (
         "Retrieval service is temporarily unavailable."
     )
+
+
+
+def test_query_does_not_call_generation_when_no_chunks_are_found(
+    client,
+    monkeypatch,
+):
+    headers = create_authenticated_user(client)
+    knowledge_base_id = create_knowledge_base(client, headers)
+
+    monkeypatch.setattr(
+        query_route,
+        "retrieve_chunks",
+        lambda **kwargs: [],
+    )
+
+    def unexpected_generation(**kwargs):
+        raise AssertionError("Generation must not run without evidence.")
+
+    monkeypatch.setattr(
+        query_route,
+        "OllamaGenerationService",
+        unexpected_generation,
+    )
+
+    response = client.post(
+        f"/api/v1/knowledge-bases/{knowledge_base_id}/query",
+        headers=headers,
+        json={"query": "Question with no matching documents"},
+    )
+
+    assert response.status_code == 200
+    data = response.json()
+    assert data["results"] == []
+    assert data["sources"] == []
+    assert "could not find relevant information" in data["answer"]
+
+
+def test_query_returns_503_when_generation_fails(client, monkeypatch):
+    headers = create_authenticated_user(client)
+    knowledge_base_id = create_knowledge_base(client, headers)
+
+    result = {
+        "chunk_id": str(uuid4()),
+        "document_id": str(uuid4()),
+        "filename": "notes.pdf",
+        "chunk_index": 0,
+        "content": "Relevant evidence.",
+        "page_numbers": [1],
+        "extraction_methods": ["pymupdf_native"],
+        "score": 0.9,
+    }
+
+    monkeypatch.setattr(
+        query_route,
+        "retrieve_chunks",
+        lambda **kwargs: [result],
+    )
+
+    class FailingGenerationService:
+        def __init__(self, **kwargs):
+            pass
+
+        def generate(self, **kwargs):
+            raise query_route.GenerationError("Internal model error")
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(
+        query_route,
+        "OllamaGenerationService",
+        FailingGenerationService,
+    )
+
+    response = client.post(
+        f"/api/v1/knowledge-bases/{knowledge_base_id}/query",
+        headers=headers,
+        json={"query": "Explain this"},
+    )
+
+    assert response.status_code == 503
+    assert response.json()["detail"] == (
+        "Answer generation is temporarily unavailable."
+    )
+
+
+def test_query_removes_unknown_citation_ids(client, monkeypatch):
+    headers = create_authenticated_user(client)
+    knowledge_base_id = create_knowledge_base(client, headers)
+
+    result = {
+        "chunk_id": str(uuid4()),
+        "document_id": str(uuid4()),
+        "filename": "notes.pdf",
+        "chunk_index": 0,
+        "content": "Relevant evidence.",
+        "page_numbers": [1],
+        "extraction_methods": ["pymupdf_native"],
+        "score": 0.9,
+    }
+
+    monkeypatch.setattr(
+        query_route,
+        "retrieve_chunks",
+        lambda **kwargs: [result],
+    )
+
+    class FakeGenerationService:
+        def __init__(self, **kwargs):
+            pass
+
+        def generate(self, **kwargs):
+            return "Supported claim [S1]. Unsupported claim [S99]."
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(
+        query_route,
+        "OllamaGenerationService",
+        FakeGenerationService,
+    )
+
+    response = client.post(
+        f"/api/v1/knowledge-bases/{knowledge_base_id}/query",
+        headers=headers,
+        json={"query": "Explain this"},
+    )
+
+    assert response.status_code == 200
+    answer = response.json()["answer"]
+    assert "[S1]" in answer
+    assert "[S99]" not in answer
+
+
+def test_query_rejects_whitespace_only_question(client):
+    headers = create_authenticated_user(client)
+    knowledge_base_id = create_knowledge_base(client, headers)
+
+    response = client.post(
+        f"/api/v1/knowledge-bases/{knowledge_base_id}/query",
+        headers=headers,
+        json={"query": "    "},
+    )
+
+    assert response.status_code == 422
