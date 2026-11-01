@@ -1,0 +1,148 @@
+from uuid import UUID
+
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator, StrictInt
+
+
+class EvaluationCase(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    query_id: str = Field(min_length=1, max_length=100)
+    query: str = Field(min_length=1, max_length=10000)
+
+    relevant_chunk_ids: list[UUID] = Field(min_length=1)
+
+    relevance_grades: dict[UUID, StrictInt] = Field(default_factory=dict)
+
+    top_k: int = Field(default=5, ge=1, le=20)
+
+    @field_validator("query_id")
+    @classmethod
+    def validate_query_id(cls, value: str) -> str:
+        value = value.strip()
+        if not value:
+            raise ValueError("Query ID cannot be blank.")
+        return value
+
+    @field_validator("query")
+    @classmethod
+    def validate_query(cls, value: str) -> str:
+        value = value.strip()
+        if not value:
+            raise ValueError("Query cannot be blank.")
+        return value
+
+    @field_validator("relevant_chunk_ids")
+    @classmethod
+    def validate_relevant_chunk_ids(
+        cls,
+        value: list[UUID],
+    ) -> list[UUID]:
+        if len(value) != len(set(value)):
+            raise ValueError("Relevant chunk IDs must be unique.")
+        return value
+
+    @field_validator("relevance_grades")
+    @classmethod
+    def validate_relevance_grades(
+        cls,
+        value: dict[UUID, int],
+    ) -> dict[UUID, int]:
+        for grade in value.values():
+            if isinstance(grade, bool) or not isinstance(grade, int):
+                raise ValueError("Relevance grades must be integers.")
+
+            if not 0 <= grade <= 3:
+                raise ValueError("Relevance grades must be between 0 and 3.")
+
+        return value
+
+    @model_validator(mode="after")
+    def validate_grade_references(self):
+        relevant_ids = set(self.relevant_chunk_ids)
+
+        unknown_ids = set(self.relevance_grades) - relevant_ids
+
+        if unknown_ids:
+            raise ValueError(
+                "Relevance grades can only reference relevant chunk IDs."
+            )
+
+        return self
+
+
+class EvaluationDataset(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    dataset_name: str = Field(min_length=1, max_length=100)
+    dataset_version: str = Field(min_length=1, max_length=30)
+
+    cases: list[EvaluationCase] = Field(min_length=1)
+
+    @field_validator("dataset_name", "dataset_version")
+    @classmethod
+    def validate_metadata(cls, value: str) -> str:
+        value = value.strip()
+        if not value:
+            raise ValueError("Dataset metadata cannot be blank.")
+        return value
+
+    @model_validator(mode="after")
+    def validate_unique_query_ids(self):
+        query_ids = [case.query_id for case in self.cases]
+
+        if len(query_ids) != len(set(query_ids)):
+            raise ValueError("Query IDs must be unique within a dataset.")
+
+        return self
+
+
+class EvaluationDatasetResponse(BaseModel):
+    dataset_name: str
+    dataset_version: str
+    total_cases: int
+
+
+# API response contracts
+
+from datetime import datetime
+
+
+class EvaluationResultResponse(BaseModel):
+    id: UUID
+    query_id: str
+    query: str
+    top_k: int
+    relevant_chunk_ids: list[str]
+    retrieved_chunk_ids: list[str]
+    retrieved_results: list[dict]
+    metrics: dict[str, float]
+    duration_ms: int
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+class EvaluationRunResponse(BaseModel):
+    id: UUID
+    knowledge_base_id: UUID
+    dataset_name: str
+    dataset_version: str
+    status: str
+    total_queries: int
+    completed_queries: int
+    aggregate_metrics: dict[str, float]
+    started_at: datetime
+    completed_at: datetime | None
+    duration_ms: int | None
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+class EvaluationRunDetailResponse(EvaluationRunResponse):
+    results: list[EvaluationResultResponse]
+
+
+class EvaluationHistoryResponse(BaseModel):
+    items: list[EvaluationRunResponse]
+    total: int
+    skip: int
+    limit: int

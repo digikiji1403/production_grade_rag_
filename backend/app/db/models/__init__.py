@@ -1,13 +1,21 @@
-from backend.app.db.models.user import User
+﻿from backend.app.db.models.user import User
 from backend.app.db.models.knowledge_base import KnowledgeBase
 from backend.app.db.models.document import Document
 from backend.app.db.models.document_page import DocumentPage
 from backend.app.db.models.document_chunk import DocumentChunk
 from backend.app.db.models.job import Job
+from backend.app.db.models.processing_run import DocumentProcessingRun
+from backend.app.db.models.evaluation_run import EvaluationRun
+from backend.app.db.models.evaluation_result import EvaluationResult
+
 __all__ = [
     "User",
     "KnowledgeBase",
     "Document",
     "DocumentPage",
-    "DocumentChunk","Job",
+    "DocumentChunk",
+    "Job",
+    "DocumentProcessingRun",
+    "EvaluationRun",
+    "EvaluationResult",
 ]

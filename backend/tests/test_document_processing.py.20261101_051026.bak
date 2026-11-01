@@ -1,0 +1,359 @@
+﻿from uuid import uuid4
+
+import pytest
+
+from backend.app.db.models.user import User
+from backend.app.db.models.knowledge_base import KnowledgeBase
+from backend.app.db.models.document import Document
+from backend.app.db.models.document_page import DocumentPage
+from backend.app.db.models.document_chunk import DocumentChunk
+from backend.app.db.models.processing_run import DocumentProcessingRun
+from backend.app.db.models.processing_run import DocumentProcessingRun
+from backend.app.services.document_service import processing
+from backend.app.services.document_service.extraction import (
+    PDFExtractionResult,
+    ExtractedPage,
+)
+
+
+class FakeEmbeddingService:
+    texts = []
+    dimensions = 768
+    should_fail = False
+
+    def __init__(self, **kwargs):
+        self.dimensions = kwargs["dimensions"]
+
+    def embed_texts(self, texts):
+        type(self).texts.extend(texts)
+
+        if type(self).should_fail:
+            raise RuntimeError("Simulated embedding failure")
+
+        return [
+            [0.1] * self.dimensions
+            for _ in texts
+        ]
+
+    def close(self):
+        pass
+
+
+class FakeVectorStore:
+    deleted_documents = []
+    upserted_chunks = []
+    should_fail = False
+
+    def __init__(self, **kwargs):
+        self.storage_path = kwargs["storage_path"]
+        self.collection_name = kwargs["collection_name"]
+        self.vector_size = kwargs["vector_size"]
+
+    def delete_document(self, document_id):
+        type(self).deleted_documents.append(document_id)
+
+    def upsert_chunks(self, chunks):
+        if type(self).should_fail:
+            raise RuntimeError("Simulated Qdrant failure")
+
+        type(self).upserted_chunks.extend(chunks)
+
+    def close(self):
+        pass
+
+
+@pytest.fixture(autouse=True)
+def mock_external_services(monkeypatch):
+    FakeEmbeddingService.texts = []
+    FakeEmbeddingService.should_fail = False
+    FakeVectorStore.deleted_documents = []
+    FakeVectorStore.upserted_chunks = []
+    FakeVectorStore.should_fail = False
+
+    monkeypatch.setattr(
+        processing,
+        "OllamaEmbeddingService",
+        FakeEmbeddingService,
+    )
+    monkeypatch.setattr(
+        processing,
+        "QdrantVectorStore",
+        FakeVectorStore,
+    )
+
+
+@pytest.fixture
+def knowledge_base(db_session):
+    user = User(
+        email=f"{uuid4().hex}@example.com",
+        hashed_password="test-password-hash",
+    )
+
+    db_session.add(user)
+    db_session.flush()
+
+    kb = KnowledgeBase(
+        owner_id=user.id,
+        name="Processing Test KB",
+        description="Document processing tests",
+    )
+
+    db_session.add(kb)
+    db_session.flush()
+
+    return kb
+
+
+def create_document(db_session, knowledge_base, tmp_path, filename="sample.pdf"):
+    document = Document(
+        knowledge_base_id=knowledge_base.id,
+        filename=filename,
+        storage_path=str(tmp_path / filename),
+        content_type="application/pdf",
+        size_bytes=100,
+        checksum=f"checksum-{uuid4().hex}",
+        status="uploaded",
+    )
+
+    db_session.add(document)
+    db_session.commit()
+    db_session.refresh(document)
+
+    return document
+
+
+def test_process_document_persists_extracted_pages(
+    db_session, monkeypatch, tmp_path, knowledge_base
+):
+    document = create_document(
+        db_session, knowledge_base, tmp_path
+    )
+
+    def fake_extract_pdf(path, **kwargs):
+        return PDFExtractionResult(
+            page_count=2,
+            pages=[
+                ExtractedPage(1, "First page"),
+                ExtractedPage(2, "Second page"),
+            ],
+        )
+
+    monkeypatch.setattr(processing, "extract_pdf", fake_extract_pdf)
+
+    result = processing.process_document(db_session, document.id)
+
+    pages = (
+        db_session.query(DocumentPage)
+        .filter(DocumentPage.document_id == document.id)
+        .order_by(DocumentPage.page_number)
+        .all()
+    )
+
+    assert result.status == "processed"
+    assert result.page_count == 2
+    assert [page.text for page in pages] == [
+        "First page",
+        "Second page",
+    ]
+    assert [page.extraction_method for page in pages] == [
+        "pymupdf_native",
+        "pymupdf_native",
+    ]
+    assert [page.ocr_attempted for page in pages] == [False, False]
+
+
+def test_process_document_replaces_existing_pages(
+    db_session, monkeypatch, tmp_path, knowledge_base
+):
+    document = create_document(
+        db_session, knowledge_base, tmp_path
+    )
+
+    db_session.add(
+        DocumentPage(
+            document_id=document.id,
+            page_number=1,
+            text="Old content",
+        )
+    )
+    db_session.commit()
+
+    def fake_extract_pdf(path, **kwargs):
+        return PDFExtractionResult(
+            page_count=1,
+            pages=[ExtractedPage(1, "New content")],
+        )
+
+    monkeypatch.setattr(processing, "extract_pdf", fake_extract_pdf)
+
+    processing.process_document(db_session, document.id)
+
+    pages = (
+        db_session.query(DocumentPage)
+        .filter(DocumentPage.document_id == document.id)
+        .all()
+    )
+
+    assert len(pages) == 1
+    assert pages[0].text == "New content"
+
+
+def test_process_document_marks_failure(
+    db_session, monkeypatch, tmp_path, knowledge_base
+):
+    document = create_document(
+        db_session, knowledge_base, tmp_path, "broken.pdf"
+    )
+
+    def fake_extract_pdf(path, **kwargs):
+        raise processing.PDFExtractionError("Invalid PDF")
+
+    monkeypatch.setattr(processing, "extract_pdf", fake_extract_pdf)
+
+    with pytest.raises(processing.PDFExtractionError):
+        processing.process_document(db_session, document.id)
+
+    db_session.refresh(document)
+
+    assert document.status == "failed"
+    assert document.error_message == "Invalid PDF"
+
+
+def test_process_document_rejects_missing_document(db_session):
+    with pytest.raises(ValueError, match="Document not found"):
+        processing.process_document(db_session, uuid4())
+
+
+def test_process_document_persists_and_replaces_chunks(
+    db_session, monkeypatch, tmp_path, knowledge_base
+):
+    document = create_document(
+        db_session, knowledge_base, tmp_path, "chunk-test.pdf"
+    )
+
+    db_session.add(
+        DocumentChunk(
+            document_id=document.id,
+            chunk_index=0,
+            content="OLD CONTENT",
+            start_page=1,
+            end_page=1,
+            page_numbers=[1],
+            extraction_methods=["pymupdf_native"],
+        )
+    )
+    db_session.commit()
+
+    page_one_text = "First page content. " * 250
+    page_two_text = "Second page content. " * 250
+
+    def fake_extract_pdf(path, **kwargs):
+        return PDFExtractionResult(
+            page_count=2,
+            pages=[
+                ExtractedPage(1, page_one_text),
+                ExtractedPage(2, page_two_text),
+            ],
+        )
+
+    monkeypatch.setattr(processing, "extract_pdf", fake_extract_pdf)
+
+    result = processing.process_document(db_session, document.id)
+
+    chunks = (
+        db_session.query(DocumentChunk)
+        .filter(DocumentChunk.document_id == document.id)
+        .order_by(DocumentChunk.chunk_index)
+        .all()
+    )
+
+    assert result.status == "processed"
+    assert len(chunks) > 1
+    assert [chunk.chunk_index for chunk in chunks] == list(range(len(chunks)))
+    assert all("OLD CONTENT" not in chunk.content for chunk in chunks)
+
+    for chunk in chunks:
+        assert chunk.content.strip()
+        assert chunk.start_page <= chunk.end_page
+        assert chunk.page_numbers
+        assert chunk.start_page in chunk.page_numbers
+        assert chunk.end_page in chunk.page_numbers
+        assert chunk.extraction_methods == ["pymupdf_native"]
+
+    represented_pages = {
+        page_number
+        for chunk in chunks
+        for page_number in chunk.page_numbers
+    }
+
+    assert represented_pages == {1, 2}
+
+    # Verify embedding and vector indexing happened.
+    assert len(FakeEmbeddingService.texts) == len(chunks)
+    assert len(FakeVectorStore.upserted_chunks) == len(chunks)
+
+    for vector_chunk, db_chunk in zip(
+        FakeVectorStore.upserted_chunks, chunks
+    ):
+        assert vector_chunk["id"] == str(db_chunk.id)
+        assert vector_chunk["document_id"] == str(document.id)
+        assert vector_chunk["knowledge_base_id"] == str(knowledge_base.id)
+        assert len(vector_chunk["vector"]) == 768
+
+
+def test_process_document_marks_failure_when_embedding_fails(
+    db_session, monkeypatch, tmp_path, knowledge_base
+):
+    document = create_document(
+        db_session, knowledge_base, tmp_path
+    )
+
+    monkeypatch.setattr(
+        processing,
+        "extract_pdf",
+        lambda path, **kwargs: PDFExtractionResult(
+            page_count=1,
+            pages=[ExtractedPage(1, "Embedding failure test")],
+        ),
+    )
+
+    FakeEmbeddingService.should_fail = True
+
+    with pytest.raises(RuntimeError, match="Simulated embedding failure"):
+        processing.process_document(db_session, document.id)
+
+    db_session.refresh(document)
+
+    assert document.status == "failed"
+    assert "Simulated embedding failure" in document.error_message
+    assert not FakeVectorStore.upserted_chunks
+
+
+def test_process_document_marks_failure_when_qdrant_fails(
+    db_session, monkeypatch, tmp_path, knowledge_base
+):
+    document = create_document(
+        db_session, knowledge_base, tmp_path
+    )
+
+    monkeypatch.setattr(
+        processing,
+        "extract_pdf",
+        lambda path, **kwargs: PDFExtractionResult(
+            page_count=1,
+            pages=[ExtractedPage(1, "Qdrant failure test")],
+        ),
+    )
+
+    FakeVectorStore.should_fail = True
+
+    with pytest.raises(RuntimeError, match="Simulated Qdrant failure"):
+        processing.process_document(db_session, document.id)
+
+    db_session.refresh(document)
+
+    assert document.status == "failed"
+    assert "Simulated Qdrant failure" in document.error_message
+    assert document.id in FakeVectorStore.deleted_documents
+
+

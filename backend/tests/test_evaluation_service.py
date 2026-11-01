@@ -1,0 +1,365 @@
+from uuid import uuid4
+
+import pytest
+
+from backend.app.db.models import EvaluationResult, EvaluationRun
+from backend.app.schemas.evaluation import EvaluationDataset
+from backend.app.services import evaluation_service
+from backend.app.services.evaluation_service import (
+    EvaluationValidationError,
+    run_evaluation,
+)
+from backend.app.services.retrieval_service import RetrievalError
+
+
+class FakeScalarResult:
+    """Small stand-in for SQLAlchemy ScalarResult."""
+
+    def __init__(self, values):
+        self.values = list(values)
+
+    def all(self):
+        return self.values
+
+
+class FakeSession:
+    """Minimal session double for evaluation-service unit tests."""
+
+    def __init__(self, fail_on_commit=None):
+        self.runs = {}
+        self.results = []
+        self.fail_on_commit = fail_on_commit
+        self.commit_count = 0
+        self._committed_runs = {}
+        self._committed_result_count = 0
+
+    def add(self, obj):
+        if isinstance(obj, EvaluationRun):
+            if obj.id is None:
+                obj.id = uuid4()
+            self.runs[obj.id] = obj
+
+        elif isinstance(obj, EvaluationResult):
+            self.results.append(obj)
+
+    def commit(self):
+        self.commit_count += 1
+
+        if self.commit_count == self.fail_on_commit:
+            raise RuntimeError("Simulated database commit failure.")
+
+        self._committed_runs = {
+            identifier: {
+                "completed_queries": run.completed_queries,
+                "aggregate_metrics": dict(run.aggregate_metrics or {}),
+                "status": run.status,
+                "error_message": run.error_message,
+                "completed_at": run.completed_at,
+                "duration_ms": run.duration_ms,
+            }
+            for identifier, run in self.runs.items()
+        }
+        self._committed_result_count = len(self.results)
+
+    def refresh(self, obj):
+        pass
+
+    def rollback(self):
+        for identifier, values in self._committed_runs.items():
+            run = self.runs[identifier]
+            for name, value in values.items():
+                setattr(run, name, value)
+
+        del self.results[self._committed_result_count:]
+
+    def get(self, model, identifier):
+        if model is EvaluationRun:
+            return self.runs.get(identifier)
+        return None
+
+    def scalars(self, statement):
+        return FakeScalarResult([])
+
+
+def make_dataset(chunk_ids, query_count=1):
+    cases = []
+
+    for index in range(query_count):
+        cases.append(
+            {
+                "query_id": f"query-{index + 1}",
+                "query": f"Test question {index + 1}",
+                "relevant_chunk_ids": chunk_ids,
+                "top_k": 2,
+            }
+        )
+
+    return EvaluationDataset(
+        dataset_name="service-test",
+        dataset_version="1.0",
+        cases=cases,
+    )
+
+
+def test_ground_truth_rejects_invalid_chunk_ids():
+    db = FakeSession()
+    kb_id = uuid4()
+    missing_chunk_id = uuid4()
+
+    dataset = make_dataset([missing_chunk_id])
+
+    with pytest.raises(EvaluationValidationError):
+        evaluation_service._validate_ground_truth(
+            db,
+            kb_id,
+            dataset,
+        )
+
+
+def test_ground_truth_accepts_valid_chunk_ids(monkeypatch):
+    db = FakeSession()
+    kb_id = uuid4()
+    chunk_id = uuid4()
+
+    dataset = make_dataset([chunk_id])
+
+    monkeypatch.setattr(
+        db,
+        "scalars",
+        lambda statement: FakeScalarResult([chunk_id]),
+    )
+
+    evaluation_service._validate_ground_truth(
+        db,
+        kb_id,
+        dataset,
+    )
+
+
+def test_successful_evaluation_persists_results_and_aggregates(
+    monkeypatch,
+):
+    db = FakeSession()
+    kb_id = uuid4()
+    relevant_id = uuid4()
+    irrelevant_id = uuid4()
+
+    dataset = make_dataset([relevant_id], query_count=2)
+
+    monkeypatch.setattr(
+        evaluation_service,
+        "_validate_ground_truth",
+        lambda db, kb_id, dataset: None,
+    )
+
+    monkeypatch.setattr(
+        evaluation_service,
+        "retrieve_chunks",
+        lambda **kwargs: [
+            {
+                "chunk_id": relevant_id,
+                "document_id": uuid4(),
+                "filename": "sample.pdf",
+                "chunk_index": 0,
+                "score": 0.95,
+            },
+            {
+                "chunk_id": irrelevant_id,
+                "document_id": uuid4(),
+                "filename": "sample.pdf",
+                "chunk_index": 1,
+                "score": 0.80,
+            },
+        ],
+    )
+
+    run = run_evaluation(db, kb_id, dataset)
+
+    assert run.status == "completed"
+    assert run.total_queries == 2
+    assert run.completed_queries == 2
+    assert run.completed_at is not None
+    assert run.duration_ms >= 0
+
+    assert len(db.results) == 2
+    assert all(
+        result.evaluation_run_id == run.id
+        for result in db.results
+    )
+
+    assert run.aggregate_metrics["precision_at_k"] == 0.5
+    assert run.aggregate_metrics["recall_at_k"] == 1.0
+    assert run.aggregate_metrics["hit_rate_at_k"] == 1.0
+    assert run.aggregate_metrics["mrr_at_k"] == 1.0
+    assert run.aggregate_metrics["ndcg_at_k"] == 1.0
+
+
+def test_retrieval_failure_preserves_completed_results(
+    monkeypatch,
+):
+    db = FakeSession()
+    kb_id = uuid4()
+    relevant_id = uuid4()
+
+    dataset = make_dataset([relevant_id], query_count=2)
+
+    monkeypatch.setattr(
+        evaluation_service,
+        "_validate_ground_truth",
+        lambda db, kb_id, dataset: None,
+    )
+
+    calls = {"count": 0}
+
+    def fake_retrieve(**kwargs):
+        calls["count"] += 1
+
+        if calls["count"] == 2:
+            raise RetrievalError("Simulated retrieval failure.")
+
+        return [
+            {
+                "chunk_id": relevant_id,
+                "document_id": uuid4(),
+                "filename": "sample.pdf",
+                "chunk_index": 0,
+                "score": 0.95,
+            }
+        ]
+
+    monkeypatch.setattr(
+        evaluation_service,
+        "retrieve_chunks",
+        fake_retrieve,
+    )
+
+    with pytest.raises(RetrievalError):
+        run_evaluation(db, kb_id, dataset)
+
+    assert len(db.runs) == 1
+
+    run = next(iter(db.runs.values()))
+
+    assert run.status == "failed"
+    assert run.completed_queries == 1
+    assert run.error_message == "Evaluation failed (RetrievalError)."
+    assert "Simulated retrieval failure." not in run.error_message
+    assert run.completed_at is not None
+
+    assert len(db.results) == 1
+    assert db.results[0].query_id == "query-1"
+
+
+def test_failed_validation_creates_no_evaluation_run():
+    db = FakeSession()
+    kb_id = uuid4()
+    dataset = make_dataset([uuid4()])
+
+    with pytest.raises(EvaluationValidationError):
+        run_evaluation(db, kb_id, dataset)
+
+    assert db.runs == {}
+    assert db.results == []
+
+
+
+def test_failed_result_commit_does_not_count_as_completed(
+    monkeypatch,
+):
+    db = FakeSession(fail_on_commit=2)
+    kb_id = uuid4()
+    relevant_id = uuid4()
+
+    dataset = make_dataset([relevant_id])
+
+    monkeypatch.setattr(
+        evaluation_service,
+        "_validate_ground_truth",
+        lambda db, kb_id, dataset: None,
+    )
+
+    monkeypatch.setattr(
+        evaluation_service,
+        "retrieve_chunks",
+        lambda **kwargs: [
+            {
+                "chunk_id": relevant_id,
+                "document_id": uuid4(),
+                "filename": "sample.pdf",
+                "chunk_index": 0,
+                "score": 0.95,
+            }
+        ],
+    )
+
+    with pytest.raises(RuntimeError, match="commit failure"):
+        run_evaluation(db, kb_id, dataset)
+
+    run = next(iter(db.runs.values()))
+
+    assert run.status == "failed"
+    assert run.completed_queries == 0
+    assert len(db.results) == 0
+    assert run.aggregate_metrics["precision_at_k"] == 0.0
+    assert run.aggregate_metrics["recall_at_k"] == 0.0
+    assert run.aggregate_metrics["hit_rate_at_k"] == 0.0
+    assert run.aggregate_metrics["mrr_at_k"] == 0.0
+    assert run.aggregate_metrics["ndcg_at_k"] == 0.0
+
+
+def test_original_exception_survives_failure_status_commit_failure(
+    monkeypatch,
+    caplog,
+):
+    db = FakeSession(fail_on_commit=3)
+    kb_id = uuid4()
+    relevant_id = uuid4()
+
+    dataset = make_dataset([relevant_id], query_count=2)
+
+    monkeypatch.setattr(
+        evaluation_service,
+        "_validate_ground_truth",
+        lambda db, kb_id, dataset: None,
+    )
+
+    calls = {"count": 0}
+
+    def fake_retrieve(**kwargs):
+        calls["count"] += 1
+
+        if calls["count"] == 2:
+            raise RetrievalError("Original retrieval failure.")
+
+        return [
+            {
+                "chunk_id": relevant_id,
+                "document_id": uuid4(),
+                "filename": "sample.pdf",
+                "chunk_index": 0,
+                "score": 0.95,
+            }
+        ]
+
+    monkeypatch.setattr(
+        evaluation_service,
+        "retrieve_chunks",
+        fake_retrieve,
+    )
+
+    with pytest.raises(
+        RetrievalError,
+        match="Original retrieval failure.",
+    ):
+        run_evaluation(db, kb_id, dataset)
+
+    run = next(iter(db.runs.values()))
+
+    # The failed-status commit itself failed, so the last committed state
+    # remains running. Most importantly, the original error is preserved.
+    assert run.status == "running"
+    assert run.completed_queries == 1
+    assert len(db.results) == 1
+
+    assert "Could not persist failed status" in caplog.text
+    assert "Original retrieval failure." in caplog.text

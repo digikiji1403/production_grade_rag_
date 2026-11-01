@@ -1,9 +1,9 @@
-
+﻿
 from uuid import uuid4
 
 import pytest
 
-from backend.app.db.models import User, KnowledgeBase, Document, Job
+from backend.app.db.models import User, KnowledgeBase, Document, Job, DocumentProcessingRun
 
 
 @pytest.fixture
@@ -470,3 +470,192 @@ def test_delete_document_not_found(
     )
 
     assert response.status_code == 404
+
+
+def create_processing_run(
+    db_session,
+    document,
+    attempt_number,
+    status="completed",
+    error_stage=None,
+):
+    run = DocumentProcessingRun(
+        document_id=document.id,
+        attempt_number=attempt_number,
+        status=status,
+        current_stage=None,
+        stage_timings_ms={
+            "extraction": 100,
+            "chunking": 50,
+            "embedding": 200,
+            "vector_indexing": 75,
+        },
+        page_count=2,
+        chunk_count=4,
+        embedding_count=4,
+        error_stage=error_stage,
+        error_message="Simulated failure" if error_stage else None,
+        duration_ms=425,
+    )
+
+    db_session.add(run)
+    db_session.commit()
+    db_session.refresh(run)
+
+    return run
+
+
+def test_get_document_processing_runs_success(
+    client,
+    db_session,
+    knowledge_base,
+    authenticated_user,
+    tmp_path,
+):
+    document, _ = create_test_document(
+        db_session, knowledge_base, tmp_path
+    )
+
+    run = create_processing_run(
+        db_session,
+        document,
+        attempt_number=1,
+    )
+
+    response = client.get(
+        f"/api/v1/knowledge-bases/{knowledge_base.id}/documents/{document.id}/processing-runs",
+        headers={
+            "Authorization": f"Bearer {authenticated_user['token']}"
+        },
+    )
+
+    assert response.status_code == 200
+
+    data = response.json()
+
+    assert len(data) == 1
+    assert data[0]["id"] == str(run.id)
+    assert data[0]["document_id"] == str(document.id)
+    assert data[0]["attempt_number"] == 1
+    assert data[0]["status"] == "completed"
+    assert data[0]["page_count"] == 2
+    assert data[0]["chunk_count"] == 4
+    assert data[0]["embedding_count"] == 4
+    assert data[0]["duration_ms"] == 425
+    assert data[0]["error_stage"] is None
+    assert "extraction" in data[0]["stage_timings_ms"]
+
+
+def test_get_document_processing_runs_requires_authentication(
+    client,
+    knowledge_base,
+    tmp_path,
+    db_session,
+):
+    document, _ = create_test_document(
+        db_session, knowledge_base, tmp_path
+    )
+
+    response = client.get(
+        f"/api/v1/knowledge-bases/{knowledge_base.id}/documents/{document.id}/processing-runs"
+    )
+
+    assert response.status_code == 401
+
+
+def test_get_document_processing_runs_rejects_foreign_document(
+    client,
+    db_session,
+    authenticated_user,
+):
+    another_user = User(
+        email=f"{uuid4().hex}@example.com",
+        hashed_password="test-password-hash",
+    )
+    db_session.add(another_user)
+    db_session.flush()
+
+    foreign_kb = KnowledgeBase(
+        owner_id=another_user.id,
+        name="Foreign KB",
+        description="Private",
+    )
+    db_session.add(foreign_kb)
+    db_session.flush()
+
+    foreign_document = Document(
+        knowledge_base_id=foreign_kb.id,
+        filename="private.pdf",
+        storage_path="private.pdf",
+        content_type="application/pdf",
+        size_bytes=100,
+        checksum=uuid4().hex,
+        status="processed",
+    )
+    db_session.add(foreign_document)
+    db_session.commit()
+
+    response = client.get(
+        f"/api/v1/knowledge-bases/{foreign_kb.id}/documents/{foreign_document.id}/processing-runs",
+        headers={
+            "Authorization": f"Bearer {authenticated_user['token']}"
+        },
+    )
+
+    assert response.status_code == 404
+
+
+def test_get_document_processing_runs_pagination(
+    client,
+    db_session,
+    knowledge_base,
+    authenticated_user,
+    tmp_path,
+):
+    document, _ = create_test_document(
+        db_session, knowledge_base, tmp_path
+    )
+
+    for attempt in range(1, 4):
+        create_processing_run(
+            db_session,
+            document,
+            attempt_number=attempt,
+        )
+
+    response = client.get(
+        f"/api/v1/knowledge-bases/{knowledge_base.id}/documents/{document.id}/processing-runs",
+        params={"skip": 1, "limit": 1},
+        headers={
+            "Authorization": f"Bearer {authenticated_user['token']}"
+        },
+    )
+
+    assert response.status_code == 200
+
+    data = response.json()
+
+    assert len(data) == 1
+    assert data[0]["attempt_number"] == 2
+
+
+def test_get_document_processing_runs_rejects_invalid_pagination(
+    client,
+    db_session,
+    knowledge_base,
+    authenticated_user,
+    tmp_path,
+):
+    document, _ = create_test_document(
+        db_session, knowledge_base, tmp_path
+    )
+
+    response = client.get(
+        f"/api/v1/knowledge-bases/{knowledge_base.id}/documents/{document.id}/processing-runs",
+        params={"limit": 101},
+        headers={
+            "Authorization": f"Bearer {authenticated_user['token']}"
+        },
+    )
+
+    assert response.status_code == 422

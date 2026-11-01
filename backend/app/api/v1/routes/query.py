@@ -88,6 +88,7 @@ def query_knowledge_base(
             model=settings.generation_model,
             timeout=settings.generation_timeout_seconds,
             temperature=settings.generation_temperature,
+            connect_timeout=settings.generation_connect_timeout_seconds,
         )
 
         answer = generation_service.generate(

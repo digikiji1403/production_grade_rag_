@@ -14,6 +14,7 @@ class OllamaGenerationService:
         model: str,
         timeout: float = 180.0,
         temperature: float = 0.0,
+        connect_timeout: float = 5.0,
         client: httpx.Client | None = None,
     ):
         if not model.strip():
@@ -25,10 +26,16 @@ class OllamaGenerationService:
         if not 0 <= temperature <= 2:
             raise ValueError("Temperature must be between 0 and 2.")
 
+        if connect_timeout <= 0:
+            raise ValueError("Connection timeout must be greater than zero.")
+
         self.base_url = base_url.rstrip("/")
         self.model = model
         self.temperature = temperature
-        self.client = client or httpx.Client(timeout=timeout)
+        self.client = client or httpx.Client(
+            timeout=httpx.Timeout(timeout, connect=connect_timeout),
+            trust_env=False,
+        )
 
     def generate(self, system_prompt: str, user_prompt: str) -> str:
         """Generate and validate a non-streaming response."""

@@ -1,4 +1,4 @@
-from uuid import uuid4
+﻿from uuid import uuid4
 
 import pytest
 
@@ -7,6 +7,9 @@ from backend.app.db.models.knowledge_base import KnowledgeBase
 from backend.app.db.models.document import Document
 from backend.app.db.models.document_page import DocumentPage
 from backend.app.db.models.document_chunk import DocumentChunk
+from backend.app.db.models.processing_run import DocumentProcessingRun
+from backend.app.db.models.processing_run import DocumentProcessingRun
+from backend.app.db.models.processing_run import DocumentProcessingRun
 from backend.app.services.document_service import processing
 from backend.app.services.document_service.extraction import (
     PDFExtractionResult,
@@ -102,6 +105,15 @@ def knowledge_base(db_session):
     return kb
 
 
+
+
+def get_processing_runs(db_session, document_id):
+    return (
+        db_session.query(DocumentProcessingRun)
+        .filter(DocumentProcessingRun.document_id == document_id)
+        .order_by(DocumentProcessingRun.attempt_number)
+        .all()
+    )
 def create_document(db_session, knowledge_base, tmp_path, filename="sample.pdf"):
     document = Document(
         knowledge_base_id=knowledge_base.id,
@@ -159,6 +171,31 @@ def test_process_document_persists_extracted_pages(
     ]
     assert [page.ocr_attempted for page in pages] == [False, False]
 
+    runs = get_processing_runs(db_session, document.id)
+
+    assert len(runs) == 1
+    run = runs[0]
+
+    assert run.attempt_number == 1
+    assert run.status == "completed"
+    assert run.current_stage is None
+    assert run.page_count == 2
+    assert run.chunk_count > 0
+    assert run.embedding_count == run.chunk_count
+    assert run.error_stage is None
+    assert run.completed_at is not None
+    assert run.duration_ms is not None
+    assert run.duration_ms >= 0
+
+    expected_stages = {
+        "extraction",
+        "chunking",
+        "embedding",
+        "vector_indexing",
+    }
+    assert set(run.stage_timings_ms) == expected_stages
+    assert all(value >= 0 for value in run.stage_timings_ms.values())
+
 
 def test_process_document_replaces_existing_pages(
     db_session, monkeypatch, tmp_path, knowledge_base
@@ -215,6 +252,14 @@ def test_process_document_marks_failure(
 
     assert document.status == "failed"
     assert document.error_message == "Invalid PDF"
+
+    runs = get_processing_runs(db_session, document.id)
+
+    assert len(runs) == 1
+    assert runs[0].status == "failed"
+    assert runs[0].error_stage == "extraction"
+    assert runs[0].error_message == "Invalid PDF"
+    assert runs[0].completed_at is not None
 
 
 def test_process_document_rejects_missing_document(db_session):
@@ -326,6 +371,13 @@ def test_process_document_marks_failure_when_embedding_fails(
     assert "Simulated embedding failure" in document.error_message
     assert not FakeVectorStore.upserted_chunks
 
+    runs = get_processing_runs(db_session, document.id)
+
+    assert len(runs) == 1
+    assert runs[0].status == "failed"
+    assert runs[0].error_stage == "embedding"
+    assert "Simulated embedding failure" in runs[0].error_message
+
 
 def test_process_document_marks_failure_when_qdrant_fails(
     db_session, monkeypatch, tmp_path, knowledge_base
@@ -353,3 +405,53 @@ def test_process_document_marks_failure_when_qdrant_fails(
     assert document.status == "failed"
     assert "Simulated Qdrant failure" in document.error_message
     assert document.id in FakeVectorStore.deleted_documents
+
+    runs = get_processing_runs(db_session, document.id)
+
+    assert len(runs) == 1
+    assert runs[0].status == "failed"
+    assert runs[0].error_stage == "vector_indexing"
+    assert "Simulated Qdrant failure" in runs[0].error_message
+
+
+
+
+def test_process_document_records_separate_runs_for_retries(
+    db_session, monkeypatch, tmp_path, knowledge_base
+):
+    document = create_document(
+        db_session, knowledge_base, tmp_path, "retry-test.pdf"
+    )
+
+    monkeypatch.setattr(
+        processing,
+        "extract_pdf",
+        lambda path, **kwargs: PDFExtractionResult(
+            page_count=1,
+            pages=[ExtractedPage(1, "Retry test content")],
+        ),
+    )
+
+    # First attempt fails during embedding.
+    FakeEmbeddingService.should_fail = True
+
+    with pytest.raises(RuntimeError, match="Simulated embedding failure"):
+        processing.process_document(db_session, document.id)
+
+    # Second attempt succeeds.
+    FakeEmbeddingService.should_fail = False
+
+    result = processing.process_document(db_session, document.id)
+
+    runs = get_processing_runs(db_session, document.id)
+
+    assert result.status == "processed"
+    assert len(runs) == 2
+
+    assert runs[0].attempt_number == 1
+    assert runs[0].status == "failed"
+    assert runs[0].error_stage == "embedding"
+
+    assert runs[1].attempt_number == 2
+    assert runs[1].status == "completed"
+    assert runs[1].error_stage is None

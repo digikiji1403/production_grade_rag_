@@ -1,4 +1,4 @@
-import uuid
+﻿import uuid
 from datetime import datetime
 
 from sqlalchemy import DateTime, ForeignKey, String, Text, Uuid, func
@@ -50,4 +50,11 @@ class KnowledgeBase(Base):
         "Document",
         back_populates="knowledge_base",
         cascade="all, delete-orphan",
+    )
+
+    evaluation_runs = relationship(
+        "EvaluationRun",
+        back_populates="knowledge_base",
+        cascade="all, delete-orphan",
+        passive_deletes=True,
     )

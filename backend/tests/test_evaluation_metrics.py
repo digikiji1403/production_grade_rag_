@@ -1,0 +1,204 @@
+﻿from uuid import uuid4
+
+import pytest
+
+from backend.app.services.evaluation_metrics import (
+    calculate_retrieval_metrics,
+)
+
+
+def test_perfect_retrieval():
+    first, second, third = [str(uuid4()) for _ in range(3)]
+
+    metrics = calculate_retrieval_metrics(
+        retrieved_chunk_ids=[first, second, third],
+        relevant_chunk_ids=[first, second, third],
+        k=3,
+    )
+
+    assert metrics["precision_at_k"] == pytest.approx(1.0)
+    assert metrics["recall_at_k"] == pytest.approx(1.0)
+    assert metrics["hit_rate_at_k"] == pytest.approx(1.0)
+    assert metrics["mrr_at_k"] == pytest.approx(1.0)
+    assert metrics["ndcg_at_k"] == pytest.approx(1.0)
+
+
+def test_metrics_for_partially_relevant_results():
+    relevant_first, relevant_second, irrelevant = [
+        str(uuid4()) for _ in range(3)
+    ]
+
+    metrics = calculate_retrieval_metrics(
+        retrieved_chunk_ids=[
+            irrelevant,
+            relevant_first,
+            relevant_second,
+        ],
+        relevant_chunk_ids=[
+            relevant_first,
+            relevant_second,
+        ],
+        k=3,
+    )
+
+    assert metrics["precision_at_k"] == pytest.approx(2 / 3)
+    assert metrics["recall_at_k"] == pytest.approx(1.0)
+    assert metrics["hit_rate_at_k"] == pytest.approx(1.0)
+    assert metrics["mrr_at_k"] == pytest.approx(0.5)
+    assert 0 < metrics["ndcg_at_k"] < 1
+
+
+def test_no_relevant_results():
+    relevant = str(uuid4())
+
+    metrics = calculate_retrieval_metrics(
+        retrieved_chunk_ids=[str(uuid4()), str(uuid4())],
+        relevant_chunk_ids=[relevant],
+        k=5,
+    )
+
+    assert metrics["precision_at_k"] == 0.0
+    assert metrics["recall_at_k"] == 0.0
+    assert metrics["hit_rate_at_k"] == 0.0
+    assert metrics["mrr_at_k"] == 0.0
+    assert metrics["ndcg_at_k"] == 0.0
+
+
+def test_duplicate_retrieved_ids_do_not_inflate_metrics():
+    relevant = str(uuid4())
+
+    metrics = calculate_retrieval_metrics(
+        retrieved_chunk_ids=[relevant, relevant, relevant],
+        relevant_chunk_ids=[relevant],
+        k=3,
+    )
+
+    assert metrics["precision_at_k"] == pytest.approx(1 / 3)
+    assert metrics["recall_at_k"] == pytest.approx(1.0)
+    assert metrics["mrr_at_k"] == pytest.approx(1.0)
+
+
+def test_precision_uses_requested_k_even_when_fewer_results_exist():
+    relevant = str(uuid4())
+
+    metrics = calculate_retrieval_metrics(
+        retrieved_chunk_ids=[relevant],
+        relevant_chunk_ids=[relevant],
+        k=5,
+    )
+
+    assert metrics["precision_at_k"] == pytest.approx(1 / 5)
+    assert metrics["recall_at_k"] == pytest.approx(1.0)
+
+
+def test_mrr_rewards_higher_ranked_relevant_results():
+    relevant = str(uuid4())
+    irrelevant = [str(uuid4()) for _ in range(2)]
+
+    metrics = calculate_retrieval_metrics(
+        retrieved_chunk_ids=[*irrelevant, relevant],
+        relevant_chunk_ids=[relevant],
+        k=3,
+    )
+
+    assert metrics["mrr_at_k"] == pytest.approx(1 / 3)
+
+
+def test_ndcg_supports_graded_relevance():
+    highly_relevant, partially_relevant = [
+        str(uuid4()) for _ in range(2)
+    ]
+
+    ideal = calculate_retrieval_metrics(
+        retrieved_chunk_ids=[highly_relevant, partially_relevant],
+        relevant_chunk_ids=[highly_relevant, partially_relevant],
+        relevance_grades={
+            highly_relevant: 3,
+            partially_relevant: 1,
+        },
+        k=2,
+    )
+
+    reversed_order = calculate_retrieval_metrics(
+        retrieved_chunk_ids=[partially_relevant, highly_relevant],
+        relevant_chunk_ids=[highly_relevant, partially_relevant],
+        relevance_grades={
+            highly_relevant: 3,
+            partially_relevant: 1,
+        },
+        k=2,
+    )
+
+    assert ideal["ndcg_at_k"] == pytest.approx(1.0)
+    assert reversed_order["ndcg_at_k"] < ideal["ndcg_at_k"]
+
+
+@pytest.mark.parametrize("invalid_k", [0, -1, 1.5, True])
+def test_rejects_invalid_k(invalid_k):
+    with pytest.raises(ValueError):
+        calculate_retrieval_metrics(
+            retrieved_chunk_ids=[],
+            relevant_chunk_ids=[str(uuid4())],
+            k=invalid_k,
+        )
+
+
+def test_rejects_empty_ground_truth():
+    with pytest.raises(ValueError, match="relevant chunk"):
+        calculate_retrieval_metrics(
+            retrieved_chunk_ids=[],
+            relevant_chunk_ids=[],
+            k=5,
+        )
+
+
+def test_rejects_negative_relevance_grade():
+    relevant = str(uuid4())
+
+    with pytest.raises(ValueError, match="cannot be negative"):
+        calculate_retrieval_metrics(
+            retrieved_chunk_ids=[relevant],
+            relevant_chunk_ids=[relevant],
+            relevance_grades={relevant: -1},
+            k=5,
+        )
+from uuid import uuid4
+
+import pytest
+
+
+def test_ndcg_defaults_missing_relevance_grades_to_one():
+    highly_relevant, ungraded = [str(uuid4()) for _ in range(2)]
+
+    ideal = calculate_retrieval_metrics(
+        retrieved_chunk_ids=[highly_relevant, ungraded],
+        relevant_chunk_ids=[highly_relevant, ungraded],
+        relevance_grades={highly_relevant: 3},
+        k=2,
+    )
+
+    reversed_order = calculate_retrieval_metrics(
+        retrieved_chunk_ids=[ungraded, highly_relevant],
+        relevant_chunk_ids=[highly_relevant, ungraded],
+        relevance_grades={highly_relevant: 3},
+        k=2,
+    )
+
+    assert ideal["ndcg_at_k"] == pytest.approx(1.0)
+    assert reversed_order["ndcg_at_k"] < ideal["ndcg_at_k"]
+
+
+def test_explicit_zero_relevance_grade_is_non_relevant():
+    relevant, non_relevant = [str(uuid4()) for _ in range(2)]
+
+    metrics = calculate_retrieval_metrics(
+        retrieved_chunk_ids=[non_relevant, relevant],
+        relevant_chunk_ids=[relevant, non_relevant],
+        relevance_grades={relevant: 2, non_relevant: 0},
+        k=2,
+    )
+
+    assert metrics["precision_at_k"] == pytest.approx(0.5)
+    assert metrics["recall_at_k"] == pytest.approx(1.0)
+    assert metrics["mrr_at_k"] == pytest.approx(0.5)
+    assert metrics["ndcg_at_k"] < 1.0

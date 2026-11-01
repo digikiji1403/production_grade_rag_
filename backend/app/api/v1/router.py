@@ -4,6 +4,7 @@ from fastapi import APIRouter
 from backend.app.api.v1.routes import (
     auth,
     documents,
+    evaluations,
     health,
     knowledge_bases,
     query,
@@ -35,3 +36,9 @@ api_router.include_router(
 )
 
 api_router.include_router(query.router, prefix="/knowledge-bases", tags=["Retrieval"])
+
+api_router.include_router(
+    evaluations.router,
+    prefix="/knowledge-bases",
+    tags=["Evaluations"],
+)

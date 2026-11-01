@@ -1,4 +1,4 @@
-
+﻿
 import uuid
 from datetime import datetime
 
@@ -118,6 +118,13 @@ class Document(Base):
 
     chunks = relationship(
         "DocumentChunk",
+        back_populates="document",
+        cascade="all, delete-orphan",
+        passive_deletes=True,
+    )
+
+    processing_runs = relationship(
+        "DocumentProcessingRun",
         back_populates="document",
         cascade="all, delete-orphan",
         passive_deletes=True,

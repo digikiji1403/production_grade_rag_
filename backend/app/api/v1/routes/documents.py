@@ -1,4 +1,4 @@
-
+﻿
 from pathlib import PurePosixPath
 from uuid import UUID
 
@@ -8,8 +8,8 @@ from sqlalchemy.orm import Session
 from backend.app.core.config import get_settings
 from backend.app.core.dependencies import get_current_user
 from backend.app.db.dependencies import get_db
-from backend.app.db.models import User
-from backend.app.schemas.document import DocumentResponse
+from backend.app.db.models import User, DocumentProcessingRun
+from backend.app.schemas.document import DocumentResponse, ProcessingRunResponse
 from backend.app.services.document_service.storage import (
     DocumentTooLargeError,
 )
@@ -88,6 +88,62 @@ def get_knowledge_base_document(
 
     return document
 
+
+
+
+@router.get(
+    "/{knowledge_base_id}/documents/{document_id}/processing-runs",
+    response_model=list[ProcessingRunResponse],
+)
+def get_document_processing_runs(
+    knowledge_base_id: UUID,
+    document_id: UUID,
+    skip: int = 0,
+    limit: int = 20,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    # Validate pagination.
+    if skip < 0:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="skip must be non-negative.",
+        )
+
+    if limit < 1 or limit > 100:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="limit must be between 1 and 100.",
+        )
+
+    # Verify document existence and ownership before reading telemetry.
+    document = get_document(
+        db=db,
+        knowledge_base_id=knowledge_base_id,
+        document_id=document_id,
+        owner_id=current_user.id,
+    )
+
+    if document is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Document not found.",
+        )
+
+    # Return the most recent attempts first.
+    runs = (
+        db.query(DocumentProcessingRun)
+        .filter(DocumentProcessingRun.document_id == document_id)
+        .order_by(
+            DocumentProcessingRun.attempt_number.desc(),
+            DocumentProcessingRun.started_at.desc(),
+        )
+        .offset(skip)
+        .limit(limit)
+        .all()
+    )
+
+    return runs
 
 @router.delete(
     "/{knowledge_base_id}/documents/{document_id}",

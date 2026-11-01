@@ -44,7 +44,8 @@ class Settings(BaseSettings):
 
     # Local Ollama generation
     generation_model: str = "qwen3:4b"
-    generation_timeout_seconds: int = 180
+    generation_timeout_seconds: int = 600
+    generation_connect_timeout_seconds: float = 5.0
     generation_temperature: float = 0.0
 
     # Local Qdrant vector storage

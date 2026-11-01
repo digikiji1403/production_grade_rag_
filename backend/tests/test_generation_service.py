@@ -113,3 +113,27 @@ def test_handles_missing_message():
             service.generate("System", "Question")
     finally:
         service.close()
+
+
+def test_default_client_uses_separate_connection_and_read_timeouts():
+    service = OllamaGenerationService(
+        base_url="http://localhost:11434",
+        model="qwen3:4b",
+        timeout=600,
+        connect_timeout=5,
+    )
+    try:
+        assert service.client.timeout.read == 600
+        assert service.client.timeout.connect == 5
+    finally:
+        service.close()
+
+
+def test_rejects_invalid_connection_timeout():
+    with pytest.raises(ValueError):
+        OllamaGenerationService(
+            base_url="http://localhost:11434",
+            model="qwen3:4b",
+            connect_timeout=0,
+        )
+
